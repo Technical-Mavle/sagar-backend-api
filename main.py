@@ -4,23 +4,28 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from config import supabase
 import httpx # A modern, async-ready HTTP client
+import os
 
 app = FastAPI(
     title="SAGAR Backend Service",
     description="API for querying data and orchestrating analytical jobs.",
-    version="2.0.0"
+    version="2.1.0" # Version updated
 )
 
-# --- Environment variable for the ML service URL ---
-# You'll need to add this to your Render environment variables
-ML_SERVICE_URL = "https://sagar-ml-service.onrender.com"
+# --- Get the ML service URL from an environment variable ---
+ML_SERVICE_URL = os.environ.get("ML_SERVICE_URL")
 
 # --- Pydantic Models ---
 class OrchestrationRequest(BaseModel):
-    file1_id: int = Field(..., example=14)
-    file2_id: int = Field(..., example=15) # Assuming another file is uploaded
+    file1_id: int = Field(..., example=18)
+    file2_id: int = Field(..., example=15)
     column1: str = Field(..., example="individualCount")
-    column2: str = Field(..., example="sea_surface_temp")
+    column2: str = Field(..., example="TO3")
+    # NEW: Add fields to specify coordinate column names for each file
+    file1_lat_col: str = Field(default="decimalLatitude")
+    file1_lon_col: str = Field(default="decimalLongitude")
+    file2_lat_col: str = Field(default="lat")
+    file2_lon_col: str = Field(default="lon")
 
 # --- Main Endpoints ---
 @app.post("/discover-and-correlate")
@@ -28,8 +33,11 @@ async def discover_and_correlate_data(request: OrchestrationRequest):
     """
     Finds file paths from the database and triggers the ML service for analysis.
     """
+    if not ML_SERVICE_URL:
+        raise HTTPException(status_code=500, detail="ML_SERVICE_URL environment variable is not set.")
+    
     try:
-        # 1. Query the database to get the file paths from their IDs
+        # 1. Query the database to get the file paths
         print(f"Fetching metadata for file IDs {request.file1_id} and {request.file2_id}")
         query = supabase.table('file_metadata').select("id, processed_file_location")
         query = query.in_('id', [request.file1_id, request.file2_id])
@@ -38,26 +46,27 @@ async def discover_and_correlate_data(request: OrchestrationRequest):
         if not db_response.data or len(db_response.data) < 2:
             raise HTTPException(status_code=404, detail="One or both file IDs not found in the database.")
 
-        # Create a mapping of ID to file path for easy lookup
         file_map = {item['id']: item['processed_file_location'] for item in db_response.data}
         
-        # 2. Prepare the request payload for the ML service
+        # 2. Prepare the detailed payload for the ML service
         ml_request_payload = {
             "file1_path": file_map[request.file1_id],
             "file2_path": file_map[request.file2_id],
             "column1": request.column1,
-            "column2": request.column2
+            "column2": request.column2,
+            # NEW: Pass the specific coordinate column names
+            "file1_lat_col": request.file1_lat_col,
+            "file1_lon_col": request.file1_lon_col,
+            "file2_lat_col": request.file2_lat_col,
+            "file2_lon_col": request.file2_lon_col,
         }
 
         # 3. Call the ML service to start the background job
-        print("Calling ML service to start correlation job...")
+        print(f"Calling ML service with payload: {ml_request_payload}")
         async with httpx.AsyncClient() as client:
             ml_service_endpoint = f"{ML_SERVICE_URL}/analyze/geospatial-correlation"
             response = await client.post(ml_service_endpoint, json=ml_request_payload, timeout=30.0)
-            
-            # Raise an error if the ML service failed to accept the job
             response.raise_for_status()
-            
             ml_job_data = response.json()
 
         return {
